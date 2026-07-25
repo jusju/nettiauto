@@ -9,6 +9,9 @@ so later runs skip cars already written to CSV.
 
 Use responsibly and only where permitted by Nettiauto's terms and applicable law.
 This script does not bypass login, CAPTCHAs, rate limits, or other access controls.
+When Nettiauto answers HTTP 403/429 (or shows a denial page), the scraper waits
+out escalating cool-downs and resumes instead of aborting; it only gives up
+after repeated blocks, and in --watch mode it retries on the next cycle.
 """
 
 from __future__ import annotations
@@ -37,6 +40,12 @@ from playwright.async_api import (
 
 LATEST_URL = "https://www.nettiauto.com/uusimmat?page={page}"
 
+# Nettiauto exposes a browse page per make and per make/model. Using it turns a
+# full-catalogue crawl (thousands of pages) into a handful of pages that are
+# already the cars we want, which is both far faster and far fewer requests.
+MAKE_URL = "https://www.nettiauto.com/{make}?page={page}"
+MAKE_MODEL_URL = "https://www.nettiauto.com/{make}/{model}?page={page}"
+
 # Expected ad URL form:
 # https://www.nettiauto.com/en/ford/focus/12345678
 AD_PATH_RE = re.compile(
@@ -45,6 +54,33 @@ AD_PATH_RE = re.compile(
 )
 
 PAGE_COUNT_RE = re.compile(r"\b(?:Page|Sivu)\s+\d+\s*/\s*(\d+)\b", re.IGNORECASE)
+
+# Columns written by this version of the script.
+CSV_COLUMNS = [
+    "timestamp",
+    "status",
+    "brand",
+    "model",
+    "year",
+    "km",
+    "fuel",
+    "price",
+    "city",
+    "phone",
+    "seen_count",
+    "views",
+    "id",
+    "url",
+]
+
+# An ad URL ends in /<make>/<model>/<id>; the id is recoverable from it alone.
+AD_URL_ID_RE = re.compile(
+    r"nettiauto\.com/(?:en/)?[^/\s]+/[^/\s]+/(\d{5,12})/?\s*$", re.IGNORECASE
+)
+BARE_ID_RE = re.compile(r"^\d{5,12}$")
+
+DEFAULT_MAKE = "toyota"
+DEFAULT_MODEL = "hiace"
 
 VIEW_PATTERNS = (
     re.compile(r"\bViews\s*:\s*([\d\s.,\u00a0]+)\s*times\b", re.IGNORECASE),
@@ -68,6 +104,51 @@ DENIED_MARKERS = (
     "too many requests",
     "kielletty",
 )
+
+# Escalating cool-down waits (seconds) applied after consecutive blocks.
+BLOCK_COOLDOWNS = (90.0, 240.0, 600.0, 900.0)
+
+
+class BlockedError(RuntimeError):
+    """Nettiauto rate-limited or refused a request (HTTP 403/429 or denial page)."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class BlockTracker:
+    """Waits out blocks with escalating cool-downs instead of aborting.
+
+    This respects the restriction by pausing; it does not try to evade it.
+    After too many consecutive blocks the scan gives up until the next run.
+    """
+
+    def __init__(self, cooldowns: tuple[float, ...] = BLOCK_COOLDOWNS) -> None:
+        self._cooldowns = cooldowns
+        self._strikes = 0
+
+    def reset(self) -> None:
+        self._strikes = 0
+
+    async def pause(self, exc: BlockedError) -> bool:
+        """Sleep before the next attempt. Returns False when out of retries."""
+        if self._strikes >= len(self._cooldowns):
+            return False
+
+        delay = self._cooldowns[self._strikes]
+        if exc.retry_after is not None:
+            delay = max(delay, exc.retry_after)
+        self._strikes += 1
+        print(
+            f"BLOCKED: {exc} Cooling down for {delay:.0f}s before retrying "
+            f"(attempt {self._strikes}/{len(self._cooldowns)}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        await asyncio.sleep(delay)
+        return True
+
 
 SPECIAL_CASE = {
     "bmw": "BMW",
@@ -141,6 +222,21 @@ def parse_args() -> argparse.Namespace:
         help="Start result-page number (default: 1).",
     )
     parser.add_argument(
+        "--make",
+        default=DEFAULT_MAKE,
+        help=f"Only fetch ads for this make (default: {DEFAULT_MAKE}).",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Only fetch ads whose model starts with this (default: {DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--any-car",
+        action="store_true",
+        help="Disable the make/model filter and fetch every new ad.",
+    )
+    parser.add_argument(
         "--watch",
         type=float,
         metavar="SECONDS",
@@ -171,11 +267,6 @@ def parse_args() -> argparse.Namespace:
         help="CSV output file.",
     )
     parser.add_argument(
-        "--refresh-existing",
-        action="store_true",
-        help="Revisit and print ads already stored in the database.",
-    )
-    parser.add_argument(
         "--max-ads",
         type=int,
         help="Stop after this many detail pages; useful for testing.",
@@ -197,6 +288,38 @@ def parse_args() -> argparse.Namespace:
 def clean_count(value: str) -> int | None:
     digits = re.sub(r"\D", "", value)
     return int(digits) if digits else None
+
+
+def normalise_slug(value: str) -> str:
+    """Fold a URL slug for comparison: 'Hi-Ace' and 'hiace' both become 'hiace'."""
+    return re.sub(r"[^a-z0-9]", "", unquote(value).lower())
+
+
+def url_slug(value: str) -> str:
+    """Turn user input such as 'Toyota' or 'Hi Ace' into a URL path segment."""
+    return re.sub(r"[^a-z0-9-]", "", unquote(value).strip().lower().replace(" ", "-"))
+
+
+def listing_url(make: str | None, model: str | None, page: int) -> str:
+    """The cheapest result page that can contain the cars we are collecting."""
+    if make and model:
+        return MAKE_MODEL_URL.format(make=url_slug(make), model=url_slug(model), page=page)
+    if make:
+        return MAKE_URL.format(make=url_slug(make), page=page)
+    return LATEST_URL.format(page=page)
+
+
+def link_matches(link: AdLink, make: str | None, model: str | None) -> bool:
+    """Whether an ad belongs to the make/model we are collecting.
+
+    The model uses a prefix match so trim variants such as 'hiace-4wd' or
+    'hiace-long' are kept, while unrelated models are rejected.
+    """
+    if make and normalise_slug(link.make_slug) != normalise_slug(make):
+        return False
+    if model and not normalise_slug(link.model_slug).startswith(normalise_slug(model)):
+        return False
+    return True
 
 
 def slug_to_name(slug: str) -> str:
@@ -285,32 +408,110 @@ def save_ad(connection: sqlite3.Connection, ad: AdData) -> None:
     connection.commit()
 
 
+def ad_id_from_row(row: list[str]) -> str | None:
+    """Recover an ad id from one CSV row, whatever column layout it uses.
+
+    This file has been written by several script versions with different
+    column counts, so positions from the header row cannot be trusted. The ad
+    URL is the stable anchor: it is the last field and ends in the id. Fall
+    back to the last bare-numeric field for rows whose URL is damaged.
+    """
+    for field in reversed(row):
+        match = AD_URL_ID_RE.search(field.strip())
+        if match:
+            return match.group(1)
+
+    for field in reversed(row):
+        candidate = field.strip()
+        if BARE_ID_RE.match(candidate):
+            return candidate
+
+    return None
+
+
+def ad_ids_from_csv(path: Path) -> set[str]:
+    """Every ad id already present in the CSV."""
+    if not path.exists():
+        return set()
+
+    ids: set[str] = set()
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        for index, row in enumerate(reader):
+            if index == 0 and row and row[0].strip().lower() in {"timestamp", "first_seen"}:
+                continue  # header
+            ad_id = ad_id_from_row(row)
+            if ad_id is not None:
+                ids.add(ad_id)
+    return ids
+
+
+def csv_row_for(ad: AdData) -> dict[str, str]:
+    return {
+        "timestamp": ad.timestamp,
+        "status": "NEW",
+        "brand": ad.make,
+        "model": ad.model,
+        "year": "" if ad.year is None else str(ad.year),
+        "km": "" if ad.km is None else str(ad.km),
+        "fuel": ad.fuel or "",
+        "price": "" if ad.price_eur is None else str(ad.price_eur),
+        "city": ad.city or "",
+        "phone": ad.phone or "",
+        "seen_count": "1",
+        "views": "" if ad.views is None else str(ad.views),
+        "id": ad.ad_id,
+        "url": ad.url,
+    }
+
+
+def read_csv_header(path: Path) -> list[str] | None:
+    if not path.exists():
+        return None
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.reader(handle):
+            return [field.strip() for field in row]
+    return None
+
+
 def seed_database_from_csv(connection: sqlite3.Connection, path: Path) -> None:
     if not path.exists():
         return
 
+    rows: list[tuple[str, str, str, str, str]] = []
+    header: list[str] | None = None
+
     with path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            return
-
-        id_field = "id" if "id" in reader.fieldnames else "ad_id" if "ad_id" in reader.fieldnames else None
-        if id_field is None:
-            return
-
-        rows: list[tuple[str, str, str, str, str]] = []
-        for row in reader:
-            ad_id = (row.get(id_field) or "").strip()
-            if not ad_id:
+        for index, row in enumerate(csv.reader(handle)):
+            if index == 0 and row and row[0].strip().lower() in {"timestamp", "first_seen"}:
+                header = [field.strip() for field in row]
                 continue
 
-            timestamp = (row.get("timestamp") or row.get("first_seen") or timestamp_now()).strip()
-            make = (row.get("brand") or row.get("make") or "").strip() or "unknown"
-            model = (row.get("model") or "").strip() or "unknown"
-            url = (row.get("url") or "").strip()
-            if not url:
+            ad_id = ad_id_from_row(row)
+            if ad_id is None:
+                continue
+
+            # Only positions we can trust across layouts: the first column has
+            # always been the timestamp, and brand/model have always followed
+            # the status column.
+            timestamp = row[0].strip() if row else timestamp_now()
+            make = row[2].strip() if len(row) > 2 else ""
+            model = row[3].strip() if len(row) > 3 else ""
+            url = row[-1].strip() if row else ""
+            if not AD_URL_ID_RE.search(url):
                 url = f"https://www.nettiauto.com/{ad_id}"
-            rows.append((ad_id, timestamp, make, model, url))
+
+            rows.append((ad_id, timestamp, make or "unknown", model or "unknown", url))
+
+    if header is not None and header != CSV_COLUMNS:
+        print(
+            f"NOTE: {path} uses an older column layout ({len(header)} columns); "
+            f"new rows will be written to match it. "
+            f"Delete or rename the file to start one with the full "
+            f"{len(CSV_COLUMNS)}-column layout.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     if not rows:
         return
@@ -327,46 +528,16 @@ def seed_database_from_csv(connection: sqlite3.Connection, path: Path) -> None:
 
 
 def append_csv(path: Path, ad: AdData) -> None:
-    new_file = not path.exists()
+    """Append one row, matching the column layout the file already uses."""
+    header = read_csv_header(path)
+    values = csv_row_for(ad)
+
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        if new_file:
-            writer.writerow(
-                [
-                    "timestamp",
-                    "status",
-                    "brand",
-                    "model",
-                    "year",
-                    "km",
-                    "fuel",
-                    "price",
-                    "city",
-                    "phone",
-                    "seen_count",
-                    "views",
-                    "id",
-                    "url",
-                ]
-            )
-        writer.writerow(
-            [
-                ad.timestamp,
-                "NEW",
-                ad.make,
-                ad.model,
-                "" if ad.year is None else ad.year,
-                "" if ad.km is None else ad.km,
-                "" if ad.fuel is None else ad.fuel,
-                "" if ad.price_eur is None else ad.price_eur,
-                "" if ad.city is None else ad.city,
-                "" if ad.phone is None else ad.phone,
-                1,
-                "" if ad.views is None else ad.views,
-                ad.ad_id,
-                ad.url,
-            ]
-        )
+        if header is None:
+            writer.writerow(CSV_COLUMNS)
+            header = CSV_COLUMNS
+        writer.writerow([values.get(column, "") for column in header])
 
 
 def print_ad(ad: AdData) -> None:
@@ -409,9 +580,16 @@ async def safe_goto(
             )
 
             if response is not None and response.status in {403, 429}:
-                raise RuntimeError(
-                    f"Nettiauto returned HTTP {response.status}. "
-                    "Stopping rather than bypassing the restriction."
+                retry_after: float | None = None
+                raw_retry = response.headers.get("retry-after")
+                if raw_retry:
+                    try:
+                        retry_after = float(raw_retry)
+                    except ValueError:
+                        pass
+                raise BlockedError(
+                    f"Nettiauto returned HTTP {response.status} for {url}.",
+                    retry_after=retry_after,
                 )
 
             # Give JavaScript-loaded statistics time to appear.
@@ -623,7 +801,7 @@ async def extract_ad(page: Page, link: AdLink, timeout_ms: int) -> AdData:
     text = await page_text(page)
 
     if is_denied_text(text):
-        raise RuntimeError(f"Nettiauto refused to provide data for ad {link.ad_id}.")
+        raise BlockedError(f"Nettiauto refused to provide data for ad {link.ad_id}.")
 
     price = await structured_price(page, link.ad_id)
     if price is None:
@@ -701,13 +879,50 @@ async def run_scan(
     timeout_ms = int(args.timeout * 1000)
     processed = 0
     detail_index = 0
+    blocks = BlockTracker()
+
+    want_make = None if args.any_car else (args.make or None)
+    want_model = None if args.any_car else (args.model or None)
+    target_label = (
+        "any car"
+        if not (want_make or want_model)
+        else " ".join(part for part in (want_make, want_model) if part)
+    )
+
+    # Re-read each scan so --watch runs pick up rows added since startup, and
+    # so an externally edited CSV is respected without restarting.
+    csv_ids = ad_ids_from_csv(args.csv)
+    print(
+        f"Collecting: {target_label}. "
+        f"{len(csv_ids)} ads already in {args.csv}; these will not be fetched again.",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"Listing pages: {listing_url(want_make, want_model, args.start_page)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    async def goto_search(url: str) -> bool:
+        """Load a result page, waiting out blocks. Returns False when giving up."""
+        while True:
+            try:
+                await safe_goto(search_page, url, timeout_ms)
+                blocks.reset()
+                return True
+            except BlockedError as exc:
+                if not await blocks.pause(exc):
+                    print(
+                        "Still blocked after repeated cool-downs; ending this scan.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return False
 
     try:
-        await safe_goto(
-            search_page,
-            LATEST_URL.format(page=args.start_page),
-            timeout_ms,
-        )
+        if not await goto_search(listing_url(want_make, want_model, args.start_page)):
+            return processed
 
         if args.all or args.pages is None:
             last_page = await determine_last_page(search_page)
@@ -721,52 +936,99 @@ async def run_scan(
         )
 
         for page_number in range(args.start_page, last_page + 1):
-            page_url = LATEST_URL.format(page=page_number)
+            page_url = listing_url(want_make, want_model, page_number)
             if page_number != args.start_page:
-                await safe_goto(search_page, page_url, timeout_ms)
+                if not await goto_search(page_url):
+                    return processed
 
             links = await discover_ad_links(search_page)
             if not links:
-                print(
-                    f"No ad links found on result page {page_number}; stopping.",
-                    file=sys.stderr,
-                )
+                if page_number == args.start_page and (want_make or want_model):
+                    print(
+                        f"No ads at {page_url} — check that --make/--model match "
+                        f"Nettiauto's own URL spelling (as in "
+                        f"https://www.nettiauto.com/toyota/hiace).",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"No ad links found on result page {page_number}; stopping.",
+                        file=sys.stderr,
+                    )
                 break
 
+            # Filter after the emptiness check above: a result page with no
+            # matching cars is normal and must not end the scan.
+            matching = [link for link in links if link_matches(link, want_make, want_model)]
+
             print(
-                f"Result page {page_number}: {len(links)} unique ad links",
+                f"Result page {page_number}: {len(links)} unique ad links, "
+                f"{len(matching)} matching {target_label}",
                 file=sys.stderr,
                 flush=True,
             )
-
+            links = matching
+            skipped = 0
             for link in links:
-                if not args.refresh_existing and is_seen(connection, link.ad_id):
+                # Cheapest checks first: never open a detail page for a car the
+                # CSV or the checkpoint database already holds.
+                if link.ad_id in csv_ids or is_seen(connection, link.ad_id):
+                    skipped += 1
                     continue
 
-                profile, browser = browser_pool[detail_index % len(browser_pool)]
-                detail_index += 1
-                detail_context, detail_page = await open_page_in_profile(
-                    browser, profile["user_agent"]
-                )
-                try:
-                    ad = await extract_ad(detail_page, link, timeout_ms)
-                except (RuntimeError, PlaywrightError, PlaywrightTimeoutError) as exc:
-                    print(f"ERROR: {exc}", file=sys.stderr, flush=True)
-                    if "HTTP 403" in str(exc) or "HTTP 429" in str(exc):
+                while True:
+                    profile, browser = browser_pool[detail_index % len(browser_pool)]
+                    detail_index += 1
+                    detail_context, detail_page = await open_page_in_profile(
+                        browser, profile["user_agent"]
+                    )
+                    ad: AdData | None = None
+                    block: BlockedError | None = None
+                    try:
+                        ad = await extract_ad(detail_page, link, timeout_ms)
+                    except BlockedError as exc:
+                        block = exc
+                    except (RuntimeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                        print(
+                            f"ERROR: {exc} (skipping ad {link.ad_id})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    finally:
+                        await detail_context.close()
+
+                    if block is not None:
+                        if await blocks.pause(block):
+                            continue  # retry the same ad after the cool-down
+                        print(
+                            "Still blocked after repeated cool-downs; ending this scan.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         return processed
-                    continue
-                finally:
-                    await detail_context.close()
 
-                save_ad(connection, ad)
-                append_csv(args.csv, ad)
-                print_ad(ad)
-                processed += 1
+                    if ad is not None:
+                        blocks.reset()
+                        save_ad(connection, ad)
+                        append_csv(args.csv, ad)
+                        csv_ids.add(ad.ad_id)
+                        print_ad(ad)
+                        processed += 1
 
-                if args.max_ads is not None and processed >= args.max_ads:
-                    return processed
+                        if args.max_ads is not None and processed >= args.max_ads:
+                            return processed
 
-                await sleep_between_requests(args.delay_min, args.delay_max)
+                        await sleep_between_requests(args.delay_min, args.delay_max)
+
+                    break
+
+            if skipped:
+                print(
+                    f"Result page {page_number}: skipped {skipped} already-known "
+                    f"ad(s) without fetching.",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             # A small gap between result pages.
             await sleep_between_requests(args.delay_min, args.delay_max)
